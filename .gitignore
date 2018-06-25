@@ -1,0 +1,6 @@
+debug
+vendor
+.DS_Store
+.idea
+
+debug.test
