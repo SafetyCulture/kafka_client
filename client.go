@@ -25,13 +25,13 @@ type KafkaClient interface {
 	Shutdown()
 }
 
-func NewClient(brokers ...string) (client *Client, err error) {
+func NewClient(brokers ...string) (client *Client) {
 	client = &Client{
 		brokers:    brokers,
 		inchannels: make(map[string]*Queue),
 	}
 
-	return client, nil
+	return client
 }
 
 type Client struct {
