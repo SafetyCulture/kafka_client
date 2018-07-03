@@ -83,13 +83,11 @@ func (c *Client) CreateQueue(topic string, batchtimeout time.Duration) *Queue {
 	})
 
 	go func() {
-		// queue.batch = []kgo.Message{}
 		go func() {
 			batched := time.Now()
 			for {
 				if time.Since(batched) > queue.batchtimeout {
 					batched = time.Now()
-					// MISSING finishing of bach on SHUTDOWN
 					if len(queue.batch) > 0 {
 						err := queue.writer.WriteMessages(context.Background(), queue.batch...)
 						if err != nil {
