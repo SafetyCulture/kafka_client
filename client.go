@@ -3,6 +3,8 @@ package kafka
 import (
 	"context"
 	"errors"
+	"os"
+	"os/signal"
 	"time"
 
 	kgo "github.com/segmentio/kafka-go"
@@ -13,13 +15,24 @@ type Message struct {
 	Value []byte
 }
 
-type MapFunc func([]byte) (interface{}, error)
+type Offset int
+
+const (
+	OffsetEarliest Offset = iota
+	OffsetLatest
+)
+
+type ReadConfiguration struct {
+	Group          string
+	CommitInterval time.Duration
+	Offset         Offset
+}
+
+type MapFunc func([]byte)
 
 type KafkaClient interface {
-	Export(string, []byte, []byte) error
-	SubscribeAsync(string, string) (<-chan []byte, <-chan error)
-	MapAsync(string, string, MapFunc) (<-chan interface{}, <-chan error)
-	CreateQueue(string, time.Duration) *Queue
+	CreateWriteQueue(topic string, batchtimeout time.Duration) *WriteQueue
+	CreateReadQueue(topic string, configuration ReadConfiguration) (*ReadQueue, error)
 
 	// Shutdown gracefully stops the client - let already queued messages be processed first
 	Shutdown()
@@ -27,19 +40,28 @@ type KafkaClient interface {
 
 func NewClient(brokers ...string) (client *Client) {
 	client = &Client{
-		brokers:    brokers,
-		inchannels: make(map[string]*Queue),
+		brokers:     brokers,
+		outchannels: make(map[string]*WriteQueue),
 	}
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		for range c {
+			client.Shutdown()
+		}
+	}()
 
 	return client
 }
 
 type Client struct {
-	brokers    []string
-	inchannels map[string]*Queue
+	brokers     []string
+	outchannels map[string]*WriteQueue
+	inchannels  []*ReadQueue
 }
 
-type Queue struct {
+type WriteQueue struct {
 	open         bool
 	batch        []kgo.Message
 	ch           chan<- Message
@@ -49,11 +71,11 @@ type Queue struct {
 	writer *kgo.Writer
 }
 
-func (q *Queue) Errors() <-chan error {
+func (q *WriteQueue) Errors() <-chan error {
 	return q.er
 }
 
-func (q *Queue) Push(msg Message) error {
+func (q *WriteQueue) Push(msg Message) error {
 	if !q.open {
 		return errors.New("queue is closed")
 	}
@@ -62,14 +84,14 @@ func (q *Queue) Push(msg Message) error {
 	return nil
 }
 
-func (c *Client) CreateQueue(topic string, batchtimeout time.Duration) *Queue {
-	if q, ok := c.inchannels[topic]; ok {
+func (c *Client) CreateWriteQueue(topic string, batchtimeout time.Duration) *WriteQueue {
+	if q, ok := c.outchannels[topic]; ok {
 		return q
 	}
 
 	errs := make(chan error)
 	msgs := make(chan Message)
-	queue := &Queue{
+	queue := &WriteQueue{
 		open:         true,
 		er:           errs,
 		ch:           msgs,
@@ -109,93 +131,94 @@ func (c *Client) CreateQueue(topic string, batchtimeout time.Duration) *Queue {
 		}
 	}()
 
-	c.inchannels[topic] = queue
+	c.outchannels[topic] = queue
 	return queue
 }
 
-func (c *Client) Export(topic string, key []byte, value []byte) error {
-	kwriter := kgo.NewWriter(kgo.WriterConfig{
-		Brokers: c.brokers,
-		Topic:   topic,
-	})
-	defer kwriter.Close()
+type ReadQueue struct {
+	errs chan error
 
-	err := kwriter.WriteMessages(context.Background(), kgo.Message{
-		Key:   key,
-		Value: value,
-	})
-	if err != nil {
-		return err
+	cfg    ReadConfiguration
+	reader *kgo.Reader
+}
+
+func (q *ReadQueue) Errors() <-chan error {
+	return q.errs
+}
+
+func (c *Client) CreateReadQueue(topic string, config ReadConfiguration) (*ReadQueue, error) {
+	if (config.Offset == OffsetEarliest || config.Offset == OffsetLatest) && len(config.Group) > 0 {
+		return nil, errors.New("cant use offset with group, please use either one")
 	}
 
-	return nil
-}
-
-func (c *Client) SubscribeAsync(group string, topic string) (<-chan []byte, <-chan error) {
 	reader := kgo.NewReader(kgo.ReaderConfig{
-		Brokers: c.brokers,
-		GroupID: group,
-		Topic:   topic,
+		Brokers:        c.brokers,
+		Topic:          topic,
+		GroupID:        config.Group,
+		CommitInterval: config.CommitInterval,
 	})
+	if config.Offset == OffsetLatest {
+		reader.SetOffset(-2)
+	}
 
-	items := make(chan []byte)
-	errs := make(chan error)
+	q := &ReadQueue{
+		errs:   make(chan error),
+		cfg:    config,
+		reader: reader,
+	}
 
-	go func() {
-		for {
-			m, err := reader.ReadMessage(context.Background())
-			if err != nil {
-				errs <- err
-			}
-			items <- m.Value
-		}
-	}()
+	c.inchannels = append(c.inchannels, q)
 
-	return items, errs
+	return q, nil
 }
 
-func (c *Client) MapAsync(group string, topic string, f MapFunc) (<-chan interface{}, <-chan error) {
-	items := make(chan interface{})
-	errs := make(chan error)
-
-	msgs, e := c.SubscribeAsync(group, topic)
-
-	go func() {
-		for err := range e {
-			errs <- err
-		}
-	}()
+func (q *ReadQueue) SubscribeAsync(f MapFunc) error {
+	if f == nil {
+		return errors.New("Map function cant be nil")
+	}
 
 	go func() {
-		for msg := range msgs {
-			v, e := f(msg)
-			if e != nil {
-				errs <- e
-			} else {
-				items <- v
+		ctx := context.Background()
+		for {
+			m, err := q.reader.FetchMessage(ctx)
+			if err != nil {
+				q.errs <- err
 			}
+			if q.cfg.CommitInterval <= 0 {
+				err := q.reader.CommitMessages(ctx, m)
+				if err != nil {
+					q.errs <- err
+					break
+				}
+			}
+
+			f(m.Value)
 		}
 	}()
 
-	return items, errs
+	return nil
 }
 
 // Shutdown gracefully stops the client - let already queued messages be processed first
 func (c *Client) Shutdown() {
 	for {
-		for topic, q := range c.inchannels {
+		for topic, q := range c.outchannels {
 			if q.open {
-				c.inchannels[topic].open = false
+				c.outchannels[topic].open = false
 			}
 			if len(q.ch) == 0 && len(q.batch) == 0 {
 				close(q.ch)
-				delete(c.inchannels, topic)
+				delete(c.outchannels, topic)
 
 				q.writer.Close()
 			}
 		}
 
-		if len(c.inchannels) == 0 { // Job done. Return.
+		for _, readQueu := range c.inchannels {
+			readQueu.reader.Close()
+		}
+
+		if len(c.outchannels) == 0 { // Job done. Return.
 			return
 		}
 	}
