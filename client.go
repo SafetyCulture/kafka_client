@@ -157,7 +157,7 @@ func (q *RQueue) Errors() <-chan error {
 }
 
 func (c *Client) CreateReadQueue(topic string, config ReadConfiguration) (ReadQueue, error) {
-	if (config.Offset == OffsetEarliest || config.Offset == OffsetLatest) && len(config.Group) > 0 {
+	if config.Offset == OffsetLatest && len(config.Group) > 0 {
 		return nil, errors.New("cant use offset with group, please use either one")
 	}
 
