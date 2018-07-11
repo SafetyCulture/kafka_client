@@ -3,8 +3,6 @@ package kafka
 import (
 	"context"
 	"errors"
-	"os"
-	"os/signal"
 	"time"
 
 	kgo "github.com/segmentio/kafka-go"
@@ -43,14 +41,6 @@ func NewClient(brokers ...string) (client *Client) {
 		brokers:     brokers,
 		outchannels: make(map[string]*WQueue),
 	}
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	go func() {
-		for range c {
-			client.Shutdown()
-		}
-	}()
 
 	return client
 }
