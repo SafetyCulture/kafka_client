@@ -31,8 +31,8 @@ type ReadConfiguration struct {
 type MapFunc func([]byte)
 
 type KafkaClient interface {
-	CreateWriteQueue(topic string, batchtimeout time.Duration) *WriteQueue
-	CreateReadQueue(topic string, configuration ReadConfiguration) (*ReadQueue, error)
+	CreateWriteQueue(topic string, batchtimeout time.Duration) WriteQueue
+	CreateReadQueue(topic string, configuration ReadConfiguration) (ReadQueue, error)
 
 	// Shutdown gracefully stops the client - let already queued messages be processed first
 	Shutdown()
@@ -41,7 +41,7 @@ type KafkaClient interface {
 func NewClient(brokers ...string) (client *Client) {
 	client = &Client{
 		brokers:     brokers,
-		outchannels: make(map[string]*WriteQueue),
+		outchannels: make(map[string]*WQueue),
 	}
 
 	c := make(chan os.Signal, 1)
@@ -57,11 +57,16 @@ func NewClient(brokers ...string) (client *Client) {
 
 type Client struct {
 	brokers     []string
-	outchannels map[string]*WriteQueue
-	inchannels  []*ReadQueue
+	outchannels map[string]*WQueue
+	inchannels  []*RQueue
 }
 
-type WriteQueue struct {
+type WriteQueue interface {
+	Errors() <-chan error
+	Push(Message) error
+}
+
+type WQueue struct {
 	open         bool
 	batch        []kgo.Message
 	ch           chan<- Message
@@ -71,11 +76,11 @@ type WriteQueue struct {
 	writer *kgo.Writer
 }
 
-func (q *WriteQueue) Errors() <-chan error {
+func (q *WQueue) Errors() <-chan error {
 	return q.er
 }
 
-func (q *WriteQueue) Push(msg Message) error {
+func (q *WQueue) Push(msg Message) error {
 	if !q.open {
 		return errors.New("queue is closed")
 	}
@@ -84,14 +89,14 @@ func (q *WriteQueue) Push(msg Message) error {
 	return nil
 }
 
-func (c *Client) CreateWriteQueue(topic string, batchtimeout time.Duration) *WriteQueue {
+func (c *Client) CreateWriteQueue(topic string, batchtimeout time.Duration) WriteQueue {
 	if q, ok := c.outchannels[topic]; ok {
 		return q
 	}
 
 	errs := make(chan error)
 	msgs := make(chan Message)
-	queue := &WriteQueue{
+	queue := &WQueue{
 		open:         true,
 		er:           errs,
 		ch:           msgs,
@@ -135,18 +140,23 @@ func (c *Client) CreateWriteQueue(topic string, batchtimeout time.Duration) *Wri
 	return queue
 }
 
-type ReadQueue struct {
+type ReadQueue interface {
+	SubscribeAsync(f MapFunc) error
+	Errors() <-chan error
+}
+
+type RQueue struct {
 	errs chan error
 
 	cfg    ReadConfiguration
 	reader *kgo.Reader
 }
 
-func (q *ReadQueue) Errors() <-chan error {
+func (q *RQueue) Errors() <-chan error {
 	return q.errs
 }
 
-func (c *Client) CreateReadQueue(topic string, config ReadConfiguration) (*ReadQueue, error) {
+func (c *Client) CreateReadQueue(topic string, config ReadConfiguration) (ReadQueue, error) {
 	if (config.Offset == OffsetEarliest || config.Offset == OffsetLatest) && len(config.Group) > 0 {
 		return nil, errors.New("cant use offset with group, please use either one")
 	}
@@ -161,7 +171,7 @@ func (c *Client) CreateReadQueue(topic string, config ReadConfiguration) (*ReadQ
 		reader.SetOffset(-2)
 	}
 
-	q := &ReadQueue{
+	q := &RQueue{
 		errs:   make(chan error),
 		cfg:    config,
 		reader: reader,
@@ -172,7 +182,7 @@ func (c *Client) CreateReadQueue(topic string, config ReadConfiguration) (*ReadQ
 	return q, nil
 }
 
-func (q *ReadQueue) SubscribeAsync(f MapFunc) error {
+func (q *RQueue) SubscribeAsync(f MapFunc) error {
 	if f == nil {
 		return errors.New("Map function cant be nil")
 	}
