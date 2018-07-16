@@ -94,9 +94,8 @@ func (c *Client) CreateWriteQueue(topic string, batchtimeout time.Duration) Writ
 	}
 
 	queue.writer = kgo.NewWriter(kgo.WriterConfig{
-		Brokers:      c.brokers,
-		Topic:        topic,
-		BatchTimeout: 1 * time.Microsecond,
+		Brokers: c.brokers,
+		Topic:   topic,
 	})
 
 	go func() {
